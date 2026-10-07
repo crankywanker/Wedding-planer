@@ -40,15 +40,19 @@ Every turn, return the complete profile including everything learned so far. Sto
 (use the midpoint of a range) and guest count as a number. Set complete=true once you know location, guest count,
 budget, style and food preferences; when complete, tell them their plan is ready and that they can keep chatting to refine it.`;
 
+const OPENER = "Hi! We're ready to start planning.";
+
 export async function interviewTurn(messages: ChatMessage[], profile: Profile): Promise<InterviewTurn> {
-  const history: Anthropic.Beta.BetaMessageParam[] =
-    messages.length > 0
-      ? messages.map((m) => ({ role: m.role, content: m.content }))
-      : [{ role: "user", content: "Hi! We're ready to start planning." }];
+  // The UI shows the planner's question first, but the API needs the
+  // conversation to open with a user turn, so a fixed greeting always leads.
+  const history: Anthropic.Beta.BetaMessageParam[] = [
+    { role: "user", content: OPENER },
+    ...messages.map((m) => ({ role: m.role, content: m.content })),
+  ];
 
   const response = await getClient().beta.messages.parse({
     model: MODEL,
-    max_tokens: 4000,
+    max_tokens: 8000,
     ...fallback,
     system: [
       { type: "text", text: INTERVIEW_SYSTEM, cache_control: { type: "ephemeral" } },
@@ -68,36 +72,67 @@ function profileSummary(profile: Profile, guests: number): string {
   return JSON.stringify({ ...profile, guestCount: guests || profile.guestCount }, null, 2);
 }
 
+const textOf = (content: Anthropic.Beta.BetaContentBlock[]) =>
+  content
+    .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+
+// Two steps: first research with web search (free-form notes, since search
+// results carry citations, which structured output doesn't accept), then turn
+// the notes into structured options.
 export async function recommend(brief: string, profile: Profile, guests: number): Promise<Option[]> {
-  const prompt = `Find the top 5 ${brief}
+  const research = `Research the top 5 ${brief}
 
 Couple's profile:
 ${profileSummary(profile, guests)}
 
 Use web search to find real businesses in or near their location that fit their style, capacity and budget.
-Estimate realistic current US-dollar prices for their guest count (say in priceNotes when it's an estimate).
-Give each option a short unique id (kebab-case) and each add-on a unique id. Rank best match first.`;
+For each, note: name, what kind of place/business it is, location, capacity, website, 3-5 selling points,
+realistic current US-dollar pricing for this guest count (flat and/or per guest, and whether it's published or your estimate),
+and 2-4 optional upgrades with prices. Rank best match first.`;
 
-  const messages: Anthropic.Beta.BetaMessageParam[] = [{ role: "user", content: prompt }];
-  const params = {
-    model: MODEL,
-    max_tokens: 16000,
-    ...fallback,
-    tools: [{ type: "web_search_20260209" as const, name: "web_search" as const, max_uses: 6 }],
-    output_config: { effort: "medium" as const, format: betaZodOutputFormat(RecommendationsSchema) },
-  };
-
+  const messages: Anthropic.Beta.BetaMessageParam[] = [{ role: "user", content: research }];
+  let notes = "";
   // Server tools can pause a long turn; continue it until the model finishes.
-  for (let i = 0; i < 4; i++) {
-    const response = await getClient().beta.messages.parse({ ...params, messages });
+  for (let i = 0; i < 5 && !notes; i++) {
+    const response = await getClient().beta.messages.create({
+      model: MODEL,
+      max_tokens: 16000,
+      ...fallback,
+      tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 6 }],
+      output_config: { effort: "medium" },
+      messages,
+    });
     if (response.stop_reason === "pause_turn") {
       messages.push({ role: "assistant", content: response.content });
       continue;
     }
-    if (response.stop_reason === "refusal" || !response.parsed_output) {
-      throw new Error("Couldn't build recommendations right now. Please try again.");
-    }
-    return response.parsed_output.options.slice(0, 5);
+    if (response.stop_reason === "refusal") break;
+    notes = textOf(response.content);
   }
-  throw new Error("The search took too long. Please try again.");
+  if (!notes) throw new Error("Couldn't research options right now. Please try again.");
+
+  const response = await getClient().beta.messages.parse({
+    model: MODEL,
+    max_tokens: 16000,
+    ...fallback,
+    output_config: { effort: "low", format: betaZodOutputFormat(RecommendationsSchema) },
+    messages: [
+      {
+        role: "user",
+        content: `Turn these research notes into exactly 5 options for ${guests || "the couple's"} guests.
+Use only businesses from the notes. Give each option a short unique kebab-case id and each add-on a unique id.
+Put flat costs in basePrice and per-guest costs in pricePerPerson; say in priceNotes what is estimated.
+
+<notes>
+${notes}
+</notes>`,
+      },
+    ],
+  });
+  if (response.stop_reason === "refusal" || !response.parsed_output) {
+    throw new Error("Couldn't build recommendations right now. Please try again.");
+  }
+  return response.parsed_output.options.slice(0, 5);
 }
