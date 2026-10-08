@@ -39,6 +39,16 @@ Without an `ANTHROPIC_API_KEY`, the app runs in **demo mode**. The interview is 
 
 - Next.js (App Router) + TypeScript, no UI framework.
 - `app/api/interview`: each turn sends the conversation to Claude, which returns its next question plus the updated profile as structured JSON (`lib/schemas.ts`).
-- `app/api/recommend`: Claude uses web search to find real businesses near the couple and returns 5 priced options with configurable add-ons.
+- `app/api/recommend`: two Claude calls. The first uses web search to research real businesses near the couple; the second turns those notes into 5 priced options with configurable add-ons (structured JSON). They're separate because search results carry citations, which structured output doesn't accept.
 - `lib/cost.ts`: all pricing math (headcount, add-ons, totals).
 - `lib/demo.ts`: offline stand-ins used in demo mode.
+
+## Tests
+
+```bash
+npm run typecheck   # TypeScript
+npm test            # unit tests: pricing, headcount, demo data
+npm run test:e2e    # browser test of the whole flow in demo mode
+```
+
+CI runs all three on every push (`.github/workflows/ci.yml`).
